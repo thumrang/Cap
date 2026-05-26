@@ -1,0 +1,17 @@
+{
+  "name": "Contoso Storage Reader",
+  "description": "Read-only access to storage resources.",
+  "permissions": [
+    {
+      "actions": [
+        "Microsoft.Storage/storageAccounts/read"
+      ],
+      "notActions": [],
+      "dataActions": [],
+      "notDataActions": []
+    }
+  ],
+  "assignableScopes": [
+    "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-prod"
+  ]
+}

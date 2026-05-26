@@ -1,0 +1,5 @@
+{
+  "roleDefinitionId": "/subscriptions/00000000-0000-0000-0000-000000000000/providers/Microsoft.Authorization/roleDefinitions/contributor",
+  "principalId": "22222222-2222-2222-2222-222222222222",
+  "scope": "/subscriptions/00000000-0000-0000-0000-000000000000"
+}

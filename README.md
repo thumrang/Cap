@@ -15,6 +15,15 @@ python rbac_diff.py old.json new.json --format sarif
 - ANSI color is enabled when stdout is a TTY.
 - Exit code `3` indicates at least one critical finding.
 
+## Examples
+
+Run the provided sample fixtures from a clean clone:
+
+```bash
+python rbac_diff.py examples/role-definition-old.json examples/role-definition-new.json
+python rbac_diff.py examples/role-assignment-old.json examples/role-assignment-new.json
+```
+
 ## Testing
 
 ```bash
