@@ -93,6 +93,14 @@ def summarize_permission_change(old: List[str], new: List[str], field_name: str)
     return None
 
 
+def format_list(items: List[str]) -> str:
+    if not items:
+        return "none"
+    if len(items) == 1:
+        return items[0]
+    return ", ".join(items[:-1]) + f" and {items[-1]}"
+
+
 def compare_role_definition(old: Dict[str, Any], new: Dict[str, Any]) -> Tuple[List[DiffEntry], str]:
     entries: List[DiffEntry] = []
     old_permissions = old.get("permissions", [])
@@ -101,20 +109,35 @@ def compare_role_definition(old: Dict[str, Any], new: Dict[str, Any]) -> Tuple[L
     new_perm = new_permissions[0] if new_permissions else {}
 
     summary_parts: List[str] = []
+    effective_parts: List[str] = []
+    action_added: List[str] = []
+    action_removed: List[str] = []
+
     for field in PRIVILEGE_FIELDS:
-        added, removed = compare_list(old_perm.get(field, []), new_perm.get(field, []))
+        old_values = normalize_list(old_perm.get(field, []))
+        new_values = normalize_list(new_perm.get(field, []))
+        added, removed = compare_list(old_values, new_values)
         if added or removed:
-            summary = summarize_permission_change(old_perm.get(field, []), new_perm.get(field, []), field)
+            summary = summarize_permission_change(old_values, new_values, field)
             entries.append(DiffEntry(
                 category="role_definition",
                 field=field,
-                old=normalize_list(old_perm.get(field, [])),
-                new=normalize_list(new_perm.get(field, [])),
+                old=old_values,
+                new=new_values,
                 severity=classify_change(field, added, removed, old_perm.get(field), new_perm.get(field)),
                 summary=summary or "No change",
             ))
             if summary:
                 summary_parts.append(summary)
+            if field == "actions":
+                action_added = added
+                action_removed = removed
+                if added:
+                    effective_parts.append(f"This change grants {format_list(added)}.")
+                if removed:
+                    effective_parts.append(f"It removes {format_list(removed)}.")
+            if field == "dataActions" and added:
+                effective_parts.append(f"This change grants data actions {format_list(added)}.")
 
     old_scopes = normalize_list(old.get("assignableScopes", []))
     new_scopes = normalize_list(new.get("assignableScopes", []))
@@ -133,15 +156,28 @@ def compare_role_definition(old: Dict[str, Any], new: Dict[str, Any]) -> Tuple[L
             summary_parts.append(summary)
         widened = widen_scope(old_scopes, new_scopes)
         if widened:
-            summary_parts.append(f"Assignable scope broadened to {widened}.")
+            effective_parts.append(f"Assignable scope broadened to {widened}.")
+            effective_parts.append(f"The role can now be assigned more broadly, from {format_list(old_scopes)} to {format_list(new_scopes)}.")
+        else:
+            effective_parts.append(f"Assignable scopes changed from {format_list(old_scopes)} to {format_list(new_scopes)}.")
+
+    if action_added and old_perm.get("actions"):
+        effective_parts.append(f"Previously, only {format_list(normalize_list(old_perm.get('actions', [])))} was allowed.")
+
+    if any(entry.severity == "critical" for entry in entries):
+        effective_parts.append("Net effect: privilege escalation.")
+    elif any(entry.severity == "warning" for entry in entries):
+        effective_parts.append("Net effect: increased privileges.")
 
     effect = "Role definition changed." if summary_parts else "No material role-definition change detected."
-    return entries, " ".join(summary_parts) or effect
+    narrative = " ".join(effective_parts) if effective_parts else effect
+    return entries, narrative
 
 
 def compare_role_assignment(old: Dict[str, Any], new: Dict[str, Any]) -> Tuple[List[DiffEntry], str]:
     entries: List[DiffEntry] = []
     summary_parts: List[str] = []
+    narrative_parts: List[str] = []
 
     for key in ["principalId", "roleDefinitionId", "scope"]:
         old_value = old.get(key)
@@ -157,10 +193,17 @@ def compare_role_assignment(old: Dict[str, Any], new: Dict[str, Any]) -> Tuple[L
                 summary=summary,
             ))
             summary_parts.append(summary)
+            if key == "principalId":
+                narrative_parts.append(f"The assignment was moved from principal {old_value} to {new_value}.")
+            elif key == "roleDefinitionId":
+                narrative_parts.append(f"The assigned role changed from {old_value} to {new_value}.")
+            elif key == "scope":
+                narrative_parts.append(f"The assignment scope changed from {old_value} to {new_value}.")
 
     if not summary_parts:
         summary_parts.append("No role-assignment changes detected.")
-    return entries, " ".join(summary_parts)
+    narrative = " ".join(narrative_parts) if narrative_parts else "No role-assignment changes detected."
+    return entries, narrative
 
 
 def format_text(entries: List[DiffEntry], summary: str, use_color: bool) -> str:

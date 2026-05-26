@@ -72,6 +72,8 @@ def test_role_definition_summary_critical(tmp_path):
     result = run_cli(old_path, new_path)
     assert result.returncode == 3
     assert "Assignable scope broadened to /" in result.stdout
+    assert "This change grants" in result.stdout
+    assert "Net effect: privilege escalation." in result.stdout
 
 def test_role_definition_sarif_output(tmp_path):
     old_path = tmp_path / "old.json"
@@ -93,7 +95,7 @@ def test_role_assignment_diff(tmp_path):
 
     result = run_cli(old_path, new_path)
     assert result.returncode == 0
-    assert "scope changed" in result.stdout
+    assert "The assignment was moved" in result.stdout or "The assigned role changed" in result.stdout or "The assignment scope changed" in result.stdout
 
 @pytest.mark.parametrize("bad_old,bad_new", [
     ({}, ROLE_DEF_NEW),
