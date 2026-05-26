@@ -20,3 +20,7 @@ python rbac_diff.py old.json new.json --format sarif
 ```bash
 python -m pytest
 ```
+
+## Planning
+
+The implementation is guided by the plan in `docs/plans/2026-05-26-azure-rbac-diff-plan.md`.
