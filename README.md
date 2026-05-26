@@ -24,6 +24,16 @@ python rbac_diff.py examples/role-definition-old.json examples/role-definition-n
 python rbac_diff.py examples/role-assignment-old.json examples/role-assignment-new.json
 ```
 
+Or run the demo script directly:
+
+```powershell
+./demo.ps1
+```
+
+```bash
+./demo.sh
+```
+
 ## Testing
 
 ```bash
