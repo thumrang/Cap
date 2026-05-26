@@ -1,0 +1,5 @@
+- What worked: using a simple CLI with declarative shape detection kept the implementation lightweight and easy to test.
+- What surprised me: assignable scope broadening can be handled as a separate critical signal, not just action changes.
+- What I’d do differently: add richer SARIF rule metadata and better diff granularity for multiple permission blocks.
+- One security risk mitigated: root-level scope widening is treated as critical and returns a non-zero exit code.
+- One security risk not fully mitigated: the tool assumes a single permission block and does not deeply validate nested Azure role definition structures.
