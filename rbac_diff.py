@@ -110,6 +110,7 @@ def compare_role_definition(old: Dict[str, Any], new: Dict[str, Any]) -> Tuple[L
 
     summary_parts: List[str] = []
     effective_parts: List[str] = []
+    risk_parts: List[str] = []
     action_added: List[str] = []
     action_removed: List[str] = []
 
@@ -134,10 +135,13 @@ def compare_role_definition(old: Dict[str, Any], new: Dict[str, Any]) -> Tuple[L
                 action_removed = removed
                 if added:
                     effective_parts.append(f"This change grants {format_list(added)}.")
+                    if any("*" in a or "write" in a or "delete" in a for a in added):
+                        risk_parts.append(f"Security risk: added write/delete capability {format_list(added)}.")
                 if removed:
                     effective_parts.append(f"It removes {format_list(removed)}.")
             if field == "dataActions" and added:
                 effective_parts.append(f"This change grants data actions {format_list(added)}.")
+                risk_parts.append(f"Security risk: added data-level access {format_list(added)}.")
 
     old_scopes = normalize_list(old.get("assignableScopes", []))
     new_scopes = normalize_list(new.get("assignableScopes", []))
@@ -158,6 +162,7 @@ def compare_role_definition(old: Dict[str, Any], new: Dict[str, Any]) -> Tuple[L
         if widened:
             effective_parts.append(f"Assignable scope broadened to {widened}.")
             effective_parts.append(f"The role can now be assigned more broadly, from {format_list(old_scopes)} to {format_list(new_scopes)}.")
+            risk_parts.append(f"Security risk: scope widened to {widened} — this role is now assignable across all subscriptions and resources.")
         else:
             effective_parts.append(f"Assignable scopes changed from {format_list(old_scopes)} to {format_list(new_scopes)}.")
 
@@ -166,8 +171,12 @@ def compare_role_definition(old: Dict[str, Any], new: Dict[str, Any]) -> Tuple[L
 
     if any(entry.severity == "critical" for entry in entries):
         effective_parts.append("Net effect: privilege escalation.")
+        if risk_parts:
+            effective_parts.append(f"Why this is insecure: {' '.join(risk_parts)}")
     elif any(entry.severity == "warning" for entry in entries):
         effective_parts.append("Net effect: increased privileges.")
+        if risk_parts:
+            effective_parts.append(f"Why this is insecure: {' '.join(risk_parts)}")
 
     effect = "Role definition changed." if summary_parts else "No material role-definition change detected."
     narrative = " ".join(effective_parts) if effective_parts else effect
@@ -200,6 +209,8 @@ def compare_role_assignment(old: Dict[str, Any], new: Dict[str, Any]) -> Tuple[L
             elif key == "scope":
                 narrative_parts.append(f"The assignment scope changed from {old_value} to {new_value}.")
 
+    if narrative_parts:
+        narrative_parts.append("This assignment change affects who has access, what role is granted, and where it applies.")
     if not summary_parts:
         summary_parts.append("No role-assignment changes detected.")
     narrative = " ".join(narrative_parts) if narrative_parts else "No role-assignment changes detected."
@@ -207,7 +218,7 @@ def compare_role_assignment(old: Dict[str, Any], new: Dict[str, Any]) -> Tuple[L
 
 
 def format_text(entries: List[DiffEntry], summary: str, use_color: bool) -> str:
-    lines: List[str] = [summary, ""]
+    lines: List[str] = [f"Effective permissions summary: {summary}", ""]
     for entry in entries:
         color = {
             "critical": COLOR["red"],
