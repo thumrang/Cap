@@ -95,7 +95,8 @@ def test_role_assignment_diff(tmp_path):
 
     result = run_cli(old_path, new_path)
     assert result.returncode == 0
-    assert "The assignment was moved" in result.stdout or "The assigned role changed" in result.stdout or "The assignment scope changed" in result.stdout
+    assert "Effective permissions summary:" in result.stdout
+    assert "This assignment change affects who has access" in result.stdout
 
 @pytest.mark.parametrize("bad_old,bad_new", [
     ({}, ROLE_DEF_NEW),
