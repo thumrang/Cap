@@ -1,310 +1,554 @@
 #!/usr/bin/env python3
+from __future__ import annotations
+
 import argparse
 import json
+import os
 import sys
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
+from urllib import error, request
 
-COLOR = {
-    "reset": "\x1b[0m",
-    "red": "\x1b[31m",
-    "yellow": "\x1b[33m",
-    "green": "\x1b[32m",
-    "blue": "\x1b[34m",
+
+ROLE_DEFINITION_FIELDS = (
+    "actions",
+    "notActions",
+    "dataActions",
+    "notDataActions",
+    "assignableScopes",
+)
+
+ROLE_ASSIGNMENT_FIELDS = (
+    "roleDefinitionId",
+    "principalId",
+    "scope",
+)
+
+COLORS = {
+    "info": "\033[36m",
+    "notice": "\033[34m",
+    "warning": "\033[33m",
+    "critical": "\033[31m",
+    "reset": "\033[0m",
 }
 
-PRIVILEGE_FIELDS = ["actions", "notActions", "dataActions", "notDataActions"]
 
-@dataclass
+@dataclass(frozen=True)
 class DiffEntry:
+    document: str
     category: str
     field: str
+    change: str
     old: Any
     new: Any
     severity: str
     summary: str
 
 
-def load_json(path: str) -> Any:
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Diff two Azure RBAC JSON files and summarize effective permission changes."
+    )
+    parser.add_argument("old", help="Old Azure RBAC JSON file")
+    parser.add_argument("new", help="New Azure RBAC JSON file")
+    parser.add_argument("--format", choices=("text", "sarif"), default="text")
+    parser.add_argument("--no-color", action="store_true", help="Disable ANSI color in text output")
+    parser.add_argument("--ai-summary", action="store_true", help="Add an AI-generated risk summary to text output")
+    parser.add_argument("--ai-model", default=os.getenv("OPENAI_MODEL", "gpt-4o-mini"), help="OpenAI-compatible model name")
+    parser.add_argument("--ai-base-url", default=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"), help="OpenAI-compatible API base URL")
+    parser.add_argument("--ai-timeout", type=int, default=30, help="AI request timeout in seconds")
+    args = parser.parse_args(argv)
+
+    try:
+        old_documents = load_documents(args.old)
+        new_documents = load_documents(args.new)
+        entries = diff_documents(old_documents, new_documents)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    ai_summary = None
+    if args.ai_summary:
+        if args.format != "text":
+            print("error: --ai-summary is only supported with --format text", file=sys.stderr)
+            return 2
+        try:
+            ai_summary = generate_ai_summary(entries, args.ai_model, args.ai_base_url, args.ai_timeout)
+        except (OSError, ValueError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+
+    if args.format == "sarif":
+        print(json.dumps(format_sarif(entries), indent=2))
+    else:
+        use_color = sys.stdout.isatty() and not args.no_color
+        print(format_text(entries, use_color, ai_summary))
+
+    return 1 if any(entry.severity == "critical" for entry in entries) else 0
+
+
+def load_documents(path: str) -> list[dict[str, Any]]:
     with open(path, "r", encoding="utf-8") as handle:
-        return json.load(handle)
+        data = json.load(handle)
+
+    if isinstance(data, dict) and isinstance(data.get("value"), list):
+        data = data["value"]
+
+    if isinstance(data, list):
+        documents = data
+    elif isinstance(data, dict):
+        documents = [data]
+    else:
+        raise ValueError(f"{path} must contain a JSON object, JSON array, or Azure list response")
+
+    if not all(isinstance(document, dict) for document in documents):
+        raise ValueError(f"{path} contains a non-object RBAC document")
+
+    return documents
 
 
-def is_role_definition(payload: Any) -> bool:
-    return isinstance(payload, dict) and "permissions" in payload
+def diff_documents(old_documents: list[dict[str, Any]], new_documents: list[dict[str, Any]]) -> list[DiffEntry]:
+    old_by_key = {document_key(document): document for document in old_documents}
+    new_by_key = {document_key(document): document for document in new_documents}
+    entries: list[DiffEntry] = []
+
+    for key in sorted(old_by_key.keys() - new_by_key.keys()):
+        old_document = old_by_key[key]
+        entries.append(
+            DiffEntry(
+                document=key,
+                category=document_category(old_document),
+                field="document",
+                change="removed",
+                old=key,
+                new=None,
+                severity="notice",
+                summary=f"RBAC document {key} was removed.",
+            )
+        )
+
+    for key in sorted(new_by_key.keys() - old_by_key.keys()):
+        new_document = new_by_key[key]
+        entries.append(
+            DiffEntry(
+                document=key,
+                category=document_category(new_document),
+                field="document",
+                change="added",
+                old=None,
+                new=key,
+                severity=severity_for_added_document(new_document),
+                summary=f"RBAC document {key} was added.",
+            )
+        )
+
+    for key in sorted(old_by_key.keys() & new_by_key.keys()):
+        old_document = old_by_key[key]
+        new_document = new_by_key[key]
+        if is_role_definition(old_document) or is_role_definition(new_document):
+            entries.extend(diff_role_definition(key, old_document, new_document))
+        elif is_role_assignment(old_document) or is_role_assignment(new_document):
+            entries.extend(diff_role_assignment(key, old_document, new_document))
+        else:
+            raise ValueError(f"Unsupported Azure RBAC document shape for {key}")
+
+    return entries
 
 
-def is_role_assignment(payload: Any) -> bool:
-    return isinstance(payload, dict) and "roleDefinitionId" in payload and "principalId" in payload
+def diff_role_definition(key: str, old_document: dict[str, Any], new_document: dict[str, Any]) -> list[DiffEntry]:
+    entries: list[DiffEntry] = []
+
+    for field in ROLE_DEFINITION_FIELDS:
+        old_values = set(read_role_definition_values(old_document, field))
+        new_values = set(read_role_definition_values(new_document, field))
+
+        for value in sorted(new_values - old_values):
+            severity = severity_for_added_role_definition_value(field, value, old_values)
+            entries.append(
+                DiffEntry(
+                    document=key,
+                    category="role_definition",
+                    field=field,
+                    change="added",
+                    old=None,
+                    new=value,
+                    severity=severity,
+                    summary=summarize_role_definition_addition(field, value, old_values, severity),
+                )
+            )
+
+        for value in sorted(old_values - new_values):
+            severity = severity_for_removed_role_definition_value(field)
+            entries.append(
+                DiffEntry(
+                    document=key,
+                    category="role_definition",
+                    field=field,
+                    change="removed",
+                    old=value,
+                    new=None,
+                    severity=severity,
+                    summary=summarize_role_definition_removal(field, value, severity),
+                )
+            )
+
+    return entries
 
 
-def normalize_list(value: Any) -> List[str]:
+def diff_role_assignment(key: str, old_document: dict[str, Any], new_document: dict[str, Any]) -> list[DiffEntry]:
+    entries: list[DiffEntry] = []
+
+    for field in ROLE_ASSIGNMENT_FIELDS:
+        old_value = read_property(old_document, field)
+        new_value = read_property(new_document, field)
+        if old_value == new_value:
+            continue
+
+        severity = severity_for_assignment_change(field, old_value, new_value)
+        entries.append(
+            DiffEntry(
+                document=key,
+                category="role_assignment",
+                field=field,
+                change="modified",
+                old=old_value,
+                new=new_value,
+                severity=severity,
+                summary=summarize_assignment_change(field, old_value, new_value, severity),
+            )
+        )
+
+    return entries
+
+
+def document_category(document: dict[str, Any]) -> str:
+    if is_role_definition(document):
+        return "role_definition"
+    if is_role_assignment(document):
+        return "role_assignment"
+    return "unknown"
+
+
+def is_role_definition(document: dict[str, Any]) -> bool:
+    properties = properties_of(document)
+    return "permissions" in document or "permissions" in properties or "assignableScopes" in document or "assignableScopes" in properties
+
+
+def is_role_assignment(document: dict[str, Any]) -> bool:
+    fields = set(document) | set(properties_of(document))
+    return {"roleDefinitionId", "principalId", "scope"}.issubset(fields)
+
+
+def document_key(document: dict[str, Any]) -> str:
+    prefix = "roleDefinition" if is_role_definition(document) else "roleAssignment"
+    stable_id = document.get("id") or document.get("name") or read_property(document, "id") or read_property(document, "name")
+    if stable_id:
+        return f"{prefix}:{stable_id}"
+
+    if prefix == "roleAssignment":
+        role_definition_id = read_property(document, "roleDefinitionId") or "unknown-role"
+        principal_id = read_property(document, "principalId") or "unknown-principal"
+        scope = read_property(document, "scope") or "unknown-scope"
+        return f"{prefix}:{role_definition_id}:{principal_id}:{scope}"
+
+    role_name = read_property(document, "roleName") or "unknown-role-definition"
+    return f"{prefix}:{role_name}"
+
+
+def properties_of(document: dict[str, Any]) -> dict[str, Any]:
+    properties = document.get("properties")
+    return properties if isinstance(properties, dict) else {}
+
+
+def read_property(document: dict[str, Any], field: str) -> Any:
+    if field in document:
+        return document[field]
+    return properties_of(document).get(field)
+
+
+def read_role_definition_values(document: dict[str, Any], field: str) -> list[str]:
+    if field == "assignableScopes":
+        return as_string_list(read_property(document, field))
+
+    permissions = read_property(document, "permissions")
+    if not isinstance(permissions, list):
+        return []
+
+    values: list[str] = []
+    for permission in permissions:
+        if isinstance(permission, dict):
+            values.extend(as_string_list(permission.get(field)))
+    return values
+
+
+def as_string_list(value: Any) -> list[str]:
+    if value is None:
+        return []
     if isinstance(value, list):
         return sorted(str(item) for item in value if item is not None)
-    return []
+    return [str(value)]
 
 
-def compare_list(old: Any, new: Any) -> Tuple[List[str], List[str]]:
-    old_set = set(normalize_list(old))
-    new_set = set(normalize_list(new))
-    return sorted(new_set - old_set), sorted(old_set - new_set)
+def severity_for_added_document(document: dict[str, Any]) -> str:
+    if is_role_assignment(document):
+        return "warning"
+
+    if any(is_wildcard_permission(value) for value in read_role_definition_values(document, "actions")):
+        return "critical"
+    if any(is_wildcard_permission(value) for value in read_role_definition_values(document, "dataActions")):
+        return "critical"
+    if any(is_root_scope(value) for value in read_role_definition_values(document, "assignableScopes")):
+        return "critical"
+    return "warning"
 
 
-def widen_scope(old_scopes: List[str], new_scopes: List[str]) -> Optional[str]:
-    if "/" in new_scopes and "/" not in old_scopes:
-        return "/"
-    for new_scope in new_scopes:
-        for old_scope in old_scopes:
-            if old_scope and new_scope != old_scope and new_scope.startswith(old_scope.rstrip("/")):
-                return new_scope
-    return None
-
-
-def classify_change(field: str, added: List[str], removed: List[str], old: Any, new: Any) -> str:
+def severity_for_added_role_definition_value(field: str, value: str, old_values: set[str]) -> str:
+    if field in ("actions", "dataActions"):
+        return "critical" if is_wildcard_permission(value) else "warning"
+    if field in ("notActions", "notDataActions"):
+        return "notice"
     if field == "assignableScopes":
-        if "/" in added:
+        if is_root_scope(value) or any(scope_contains(value, old_value) for old_value in old_values):
             return "critical"
-        return "warning" if added else "notice" if removed else "info"
-    if field in ["actions", "dataActions"]:
-        if any(item == "*" for item in added):
-            return "critical"
-        if added:
-            return "warning"
-        if removed:
-            return "notice"
-        return "info"
-    if field in ["notActions", "notDataActions"]:
-        if removed:
-            return "warning"
-        return "info" if added else "notice"
-    if field in ["principalId", "scope", "roleDefinitionId"]:
-        return "warning" if old and new and old != new else "info"
+        return "warning"
     return "info"
 
 
-def summarize_permission_change(old: List[str], new: List[str], field_name: str) -> Optional[str]:
-    added, removed = compare_list(old, new)
-    if added and removed:
-        return f"{field_name} changed: added {added}, removed {removed}."
-    if added:
-        return f"Added {field_name}: {added}."
-    if removed:
-        return f"Removed {field_name}: {removed}."
-    return None
+def severity_for_removed_role_definition_value(field: str) -> str:
+    if field in ("actions", "dataActions", "assignableScopes"):
+        return "notice"
+    if field in ("notActions", "notDataActions"):
+        return "warning"
+    return "info"
 
 
-def format_list(items: List[str]) -> str:
-    if not items:
+def severity_for_assignment_change(field: str, old_value: Any, new_value: Any) -> str:
+    if field == "scope":
+        old_scope = str(old_value or "")
+        new_scope = str(new_value or "")
+        return "critical" if is_root_scope(new_scope) or scope_contains(new_scope, old_scope) else "warning"
+    if field == "principalId":
+        return "warning"
+    if field == "roleDefinitionId":
+        return "warning"
+    return "info"
+
+
+def is_wildcard_permission(value: str) -> bool:
+    stripped = value.strip()
+    return stripped == "*" or stripped.endswith("/*")
+
+
+def is_root_scope(value: str) -> bool:
+    return normalize_scope(value) == "/"
+
+
+def scope_contains(candidate_parent: str, candidate_child: str) -> bool:
+    parent = normalize_scope(candidate_parent)
+    child = normalize_scope(candidate_child)
+    if parent == "/":
+        return child != "/"
+    return child != parent and child.startswith(parent + "/")
+
+
+def normalize_scope(value: str) -> str:
+    stripped = value.strip().rstrip("/")
+    return stripped or "/"
+
+
+def summarize_role_definition_addition(field: str, value: str, old_values: set[str], severity: str) -> str:
+    if field in ("actions", "dataActions"):
+        prior = f" Previously, only {format_values(old_values)} was allowed." if old_values else ""
+        net = "privilege escalation" if severity == "critical" else "privilege increase"
+        return f"This change grants {value}.{prior} Net effect: {net}."
+    if field in ("notActions", "notDataActions"):
+        return f"This change adds exclusion {value} to {field}. Net effect: privilege reduction."
+    if field == "assignableScopes":
+        net = "privilege escalation" if severity == "critical" else "broader assignment reach"
+        return f"This change broadens assignableScopes to {value}. Net effect: {net}."
+    return f"This change adds {value} to {field}."
+
+
+def summarize_role_definition_removal(field: str, value: str, severity: str) -> str:
+    if field in ("actions", "dataActions"):
+        return f"This change removes granted permission {value}. Net effect: privilege reduction."
+    if field in ("notActions", "notDataActions"):
+        return f"This change removes exclusion {value} from {field}. Net effect: privilege increase."
+    if field == "assignableScopes":
+        return f"This change removes assignable scope {value}. Net effect: narrower assignment reach."
+    return f"This change removes {value} from {field}."
+
+
+def summarize_assignment_change(field: str, old_value: Any, new_value: Any, severity: str) -> str:
+    if field == "principalId":
+        return f"This change moves the assignment from principal {old_value} to principal {new_value}. Net effect: changed assigned principal."
+    if field == "scope":
+        net = "privilege escalation" if severity == "critical" else "changed assignment reach"
+        return f"This change modifies assignment scope from {old_value} to {new_value}. Net effect: {net}."
+    if field == "roleDefinitionId":
+        return f"This change modifies assigned role from {old_value} to {new_value}. Net effect: changed effective permissions."
+    return f"This change modifies {field} from {old_value} to {new_value}."
+
+
+def format_values(values: set[str] | list[str] | tuple[str, ...]) -> str:
+    ordered = sorted(values)
+    if not ordered:
         return "none"
-    if len(items) == 1:
-        return items[0]
-    return ", ".join(items[:-1]) + f" and {items[-1]}"
+    if len(ordered) == 1:
+        return ordered[0]
+    return ", ".join(ordered[:-1]) + f" and {ordered[-1]}"
 
 
-def compare_role_definition(old: Dict[str, Any], new: Dict[str, Any]) -> Tuple[List[DiffEntry], str]:
-    entries: List[DiffEntry] = []
-    old_permissions = old.get("permissions", [])
-    new_permissions = new.get("permissions", [])
-    old_perm = old_permissions[0] if old_permissions else {}
-    new_perm = new_permissions[0] if new_permissions else {}
+def format_text(entries: list[DiffEntry], use_color: bool, ai_summary: str | None = None) -> str:
+    if not entries:
+        lines = ["No RBAC permission changes detected."]
+        if ai_summary:
+            lines.extend(["", "AI risk summary:", ai_summary])
+        return "\n".join(lines)
 
-    summary_parts: List[str] = []
-    effective_parts: List[str] = []
-    risk_parts: List[str] = []
-    action_added: List[str] = []
-    action_removed: List[str] = []
-
-    for field in PRIVILEGE_FIELDS:
-        old_values = normalize_list(old_perm.get(field, []))
-        new_values = normalize_list(new_perm.get(field, []))
-        added, removed = compare_list(old_values, new_values)
-        if added or removed:
-            summary = summarize_permission_change(old_values, new_values, field)
-            entries.append(DiffEntry(
-                category="role_definition",
-                field=field,
-                old=old_values,
-                new=new_values,
-                severity=classify_change(field, added, removed, old_perm.get(field), new_perm.get(field)),
-                summary=summary or "No change",
-            ))
-            if summary:
-                summary_parts.append(summary)
-            if field == "actions":
-                action_added = added
-                action_removed = removed
-                if added:
-                    effective_parts.append(f"This change grants {format_list(added)}.")
-                    if any("*" in a or "write" in a or "delete" in a for a in added):
-                        risk_parts.append(f"Security risk: added write/delete capability {format_list(added)}.")
-                if removed:
-                    effective_parts.append(f"It removes {format_list(removed)}.")
-            if field == "dataActions" and added:
-                effective_parts.append(f"This change grants data actions {format_list(added)}.")
-                risk_parts.append(f"Security risk: added data-level access {format_list(added)}.")
-
-    old_scopes = normalize_list(old.get("assignableScopes", []))
-    new_scopes = normalize_list(new.get("assignableScopes", []))
-    added_scopes, removed_scopes = compare_list(old_scopes, new_scopes)
-    if added_scopes or removed_scopes:
-        summary = summarize_permission_change(old_scopes, new_scopes, "assignableScopes")
-        entries.append(DiffEntry(
-            category="role_definition",
-            field="assignableScopes",
-            old=old_scopes,
-            new=new_scopes,
-            severity=classify_change("assignableScopes", added_scopes, removed_scopes, old_scopes, new_scopes),
-            summary=summary or "No change",
-        ))
-        if summary:
-            summary_parts.append(summary)
-        widened = widen_scope(old_scopes, new_scopes)
-        if widened:
-            effective_parts.append(f"Assignable scope broadened to {widened}.")
-            effective_parts.append(f"The role can now be assigned more broadly, from {format_list(old_scopes)} to {format_list(new_scopes)}.")
-            risk_parts.append(f"Security risk: scope widened to {widened} — this role is now assignable across all subscriptions and resources.")
-        else:
-            effective_parts.append(f"Assignable scopes changed from {format_list(old_scopes)} to {format_list(new_scopes)}.")
-
-    if action_added and old_perm.get("actions"):
-        effective_parts.append(f"Previously, only {format_list(normalize_list(old_perm.get('actions', [])))} was allowed.")
-
-    if any(entry.severity == "critical" for entry in entries):
-        effective_parts.append("Net effect: privilege escalation.")
-        if risk_parts:
-            effective_parts.append(f"Why this is insecure: {' '.join(risk_parts)}")
-    elif any(entry.severity == "warning" for entry in entries):
-        effective_parts.append("Net effect: increased privileges.")
-        if risk_parts:
-            effective_parts.append(f"Why this is insecure: {' '.join(risk_parts)}")
-
-    effect = "Role definition changed." if summary_parts else "No material role-definition change detected."
-    narrative = " ".join(effective_parts) if effective_parts else effect
-    return entries, narrative
-
-
-def compare_role_assignment(old: Dict[str, Any], new: Dict[str, Any]) -> Tuple[List[DiffEntry], str]:
-    entries: List[DiffEntry] = []
-    summary_parts: List[str] = []
-    narrative_parts: List[str] = []
-
-    for key in ["principalId", "roleDefinitionId", "scope"]:
-        old_value = old.get(key)
-        new_value = new.get(key)
-        if old_value != new_value:
-            summary = f"{key} changed from {old_value} to {new_value}."
-            entries.append(DiffEntry(
-                category="role_assignment",
-                field=key,
-                old=old_value,
-                new=new_value,
-                severity=classify_change(key, [new_value] if new_value else [], [old_value] if old_value else [], old_value, new_value),
-                summary=summary,
-            ))
-            summary_parts.append(summary)
-            if key == "principalId":
-                narrative_parts.append(f"The assignment was moved from principal {old_value} to {new_value}.")
-            elif key == "roleDefinitionId":
-                narrative_parts.append(f"The assigned role changed from {old_value} to {new_value}.")
-            elif key == "scope":
-                narrative_parts.append(f"The assignment scope changed from {old_value} to {new_value}.")
-
-    if narrative_parts:
-        narrative_parts.append("This assignment change affects who has access, what role is granted, and where it applies.")
-    if not summary_parts:
-        summary_parts.append("No role-assignment changes detected.")
-    narrative = " ".join(narrative_parts) if narrative_parts else "No role-assignment changes detected."
-    return entries, narrative
-
-
-def format_text(entries: List[DiffEntry], summary: str, use_color: bool) -> str:
-    lines: List[str] = [f"Effective permissions summary: {summary}", ""]
+    lines = ["Azure RBAC diff", "===============", "", "Structural diff:"]
     for entry in entries:
-        color = {
-            "critical": COLOR["red"],
-            "warning": COLOR["yellow"],
-            "notice": COLOR["blue"],
-            "info": COLOR["green"],
-        }.get(entry.severity, "") if use_color else ""
-        reset = COLOR["reset"] if use_color else ""
-        lines.append(f"{color}[{entry.severity.upper()}]{reset} {entry.field}: {entry.summary}")
+        severity = colorize(entry.severity.upper(), entry.severity, use_color)
+        lines.append(f"- [{severity}] {entry.document}")
+        lines.append(f"  {entry.change}: {entry.field}")
         lines.append(f"  old: {entry.old}")
         lines.append(f"  new: {entry.new}")
+
+    lines.extend(["", "Effective permissions summary:"])
+    for entry in entries:
+        severity = colorize(entry.severity.upper(), entry.severity, use_color)
+        lines.append(f"- [{severity}] {entry.summary}")
+
+    if ai_summary:
+        lines.extend(["", "AI risk summary:", ai_summary])
+
     return "\n".join(lines)
 
 
-def format_sarif(entries: List[DiffEntry], summary: str) -> Dict[str, Any]:
-    results = []
-    for entry in entries:
-        results.append({
-            "ruleId": entry.field,
-            "level": entry.severity,
-            "message": {"text": entry.summary},
-            "properties": {
-                "category": entry.category,
-                "old": entry.old,
-                "new": entry.new,
+def colorize(text: str, severity: str, use_color: bool) -> str:
+    if not use_color:
+        return text
+    return f"{COLORS.get(severity, '')}{text}{COLORS['reset']}"
+
+
+def generate_ai_summary(entries: list[DiffEntry], model: str, base_url: str, timeout: int) -> str:
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise ValueError("OPENAI_API_KEY must be set to use --ai-summary")
+
+    payload = {
+        "model": model,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You are an Azure RBAC security review agent. Summarize only the RBAC diff data provided. "
+                    "Do not invent resources, principals, or permissions. Keep the answer concise and actionable."
+                ),
             },
-            "locations": [],
-        })
+            {"role": "user", "content": build_ai_prompt(entries)},
+        ],
+        "temperature": 0.2,
+    }
+    body = json.dumps(payload).encode("utf-8")
+    url = base_url.rstrip("/") + "/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    http_request = request.Request(url, data=body, headers=headers, method="POST")
+
+    try:
+        with request.urlopen(http_request, timeout=timeout) as response:
+            response_payload = json.loads(response.read().decode("utf-8"))
+    except error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise OSError(f"AI provider returned HTTP {exc.code}: {detail}") from exc
+    except error.URLError as exc:
+        raise OSError(f"AI provider request failed: {exc.reason}") from exc
+
+    try:
+        content = response_payload["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise ValueError("AI provider returned an unexpected response shape") from exc
+
+    return str(content).strip()
+
+
+def build_ai_prompt(entries: list[DiffEntry]) -> str:
+    if not entries:
+        return "No Azure RBAC permission changes were detected. Confirm that there is no apparent permission impact."
+
+    diff_payload = [
+        {
+            "document": entry.document,
+            "category": entry.category,
+            "field": entry.field,
+            "change": entry.change,
+            "old": entry.old,
+            "new": entry.new,
+            "severity": entry.severity,
+            "rule_summary": entry.summary,
+        }
+        for entry in entries
+    ]
+    return (
+        "Review this Azure RBAC structural diff and produce a short agent-style risk assessment. "
+        "Include: highest risk, who/what changed if visible, effective permission impact, and recommended next step.\n\n"
+        f"Diff JSON:\n{json.dumps(diff_payload, indent=2)}"
+    )
+
+
+def format_sarif(entries: list[DiffEntry]) -> dict[str, Any]:
     return {
-        "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
+        "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
         "version": "2.1.0",
         "runs": [
             {
                 "tool": {
                     "driver": {
                         "name": "azure-rbac-diff",
-                        "informationUri": "https://github.com/example/azure-rbac-diff",
+                        "informationUri": "https://learn.microsoft.com/azure/role-based-access-control/",
                         "rules": [
-                            {"id": entry.field, "shortDescription": {"text": entry.summary}, "defaultConfiguration": {"level": entry.severity}} for entry in entries
+                            {
+                                "id": f"azure-rbac-{severity}",
+                                "name": f"Azure RBAC {severity}",
+                                "shortDescription": {"text": f"Azure RBAC {severity} change"},
+                                "defaultConfiguration": {"level": sarif_level(severity)},
+                            }
+                            for severity in ("info", "notice", "warning", "critical")
                         ],
                     }
                 },
-                "results": results,
+                "results": [
+                    {
+                        "ruleId": f"azure-rbac-{entry.severity}",
+                        "level": sarif_level(entry.severity),
+                        "message": {"text": entry.summary},
+                        "locations": [],
+                        "properties": {
+                            "severity": entry.severity,
+                            "document": entry.document,
+                            "category": entry.category,
+                            "field": entry.field,
+                            "change": entry.change,
+                            "old": entry.old,
+                            "new": entry.new,
+                        },
+                    }
+                    for entry in entries
+                ],
             }
         ],
     }
 
 
-def find_highest_severity(entries: List[DiffEntry]) -> str:
-    if any(entry.severity == "critical" for entry in entries):
-        return "critical"
-    if any(entry.severity == "warning" for entry in entries):
+def sarif_level(severity: str) -> str:
+    if severity == "critical":
+        return "error"
+    if severity == "warning":
         return "warning"
-    if any(entry.severity == "notice" for entry in entries):
-        return "notice"
-    return "info"
-
-
-def main(argv: Optional[List[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="Azure RBAC structural diff and effective permission summary.")
-    parser.add_argument("old", help="Old JSON file")
-    parser.add_argument("new", help="New JSON file")
-    parser.add_argument("--format", choices=["text", "sarif"], default="text", help="Output format")
-    parser.add_argument("--no-color", action="store_true", help="Disable ANSI color")
-    args = parser.parse_args(argv)
-
-    old_data = load_json(args.old)
-    new_data = load_json(args.new)
-
-    if is_role_definition(old_data) and is_role_definition(new_data):
-        entries, summary = compare_role_definition(old_data, new_data)
-    elif is_role_assignment(old_data) and is_role_assignment(new_data):
-        entries, summary = compare_role_assignment(old_data, new_data)
-    else:
-        print("Input files must both be role definitions or both be role assignments.", file=sys.stderr)
-        return 2
-
-    use_color = sys.stdout.isatty() and not args.no_color and args.format == "text"
-    if args.format == "sarif":
-        output = json.dumps(format_sarif(entries, summary), indent=2)
-    else:
-        output = format_text(entries, summary, use_color)
-
-    print(output)
-    severity = find_highest_severity(entries)
-    return 3 if severity == "critical" else 0
+    return "note"
 
 
 if __name__ == "__main__":

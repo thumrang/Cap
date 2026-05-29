@@ -2,36 +2,88 @@
 
 ## Goal
 
-Build a small Python CLI that compares two Azure RBAC JSON files and reports structural diffs plus an English summary of permission changes.
+Build a small Python CLI that compares two Azure RBAC JSON files and reports:
 
-## Decisions
+1. A structural diff of role definition or role assignment fields.
+2. A plain-English summary of effective permission changes.
 
-| Decision | Options | Chosen | Rationale |
-|---|---|---|---|
-| CLI output formats | `text`, `sarif`, `json` | `text`, `sarif` | `text` is default and human-friendly; `sarif` supports automated scanning. |
-| Data shapes to support | role definitions only, role assignments only, both | both | acceptance criteria requires both common shapes. |
-| Severity mapping | binary critical/non-critical, multi-level, heuristic | multi-level | needed to distinguish privilege escalation, scope widening, and informational changes. |
+## CLI
 
-## Plan
+```sh
+python3 rbac_diff.py old.json new.json --format text
+python3 rbac_diff.py old.json new.json --format sarif
+python3 rbac_diff.py old.json new.json --ai-summary
+```
 
-1. Create the CLI entrypoint and parse arguments.
-2. Detect whether inputs are role definitions or role assignments.
-3. Compare permission arrays and assignable scopes.
-4. Emit a text summary and SARIF output.
-5. Add pytest coverage for both data shapes.
+`text` is the default format. Text output uses ANSI color only when stdout is a TTY. SARIF output emits SARIF 2.1.0 JSON.
 
-## Risks and Alternatives
+`--ai-summary` adds an optional OpenAI-compatible agent summary to text output. The deterministic structural diff remains the source of truth for severity and exit codes.
 
-| Risk / question | Alternative 1 | Alternative 2 | Notes |
-|---|---|---|---|
-| Shape detection | Infer from payload fields | Require explicit type flag | Inference is simpler and meets common Azure formats. |
-| SARIF implementation | Minimal valid SARIF | Full rule metadata support | Minimal SARIF is enough for acceptance. |
-| Broad scope detection | Only root `/` widening | Any ancestor-broadened scope | Root widening is treated as critical; ancestor broadening is treated as warning. |
+## Supported Azure RBAC Inputs
 
-## Milestones
+The CLI accepts two JSON files. Each file may contain:
 
-- [x] CLI scaffold
-- [x] Role-definition diff logic
-- [x] Role-assignment diff logic
-- [x] Plain text and SARIF output
-- [x] Unit tests
+- A single Azure role definition.
+- A single Azure role assignment.
+- A flat list of role definitions or role assignments.
+- An Azure list response with a top-level `value` array.
+
+Real Azure-shaped documents are supported, including fields under `properties`.
+
+## Compared Fields
+
+Role definitions:
+
+- `permissions[].actions`
+- `permissions[].notActions`
+- `permissions[].dataActions`
+- `permissions[].notDataActions`
+- `assignableScopes`
+
+Role assignments:
+
+- `roleDefinitionId`
+- `principalId`
+- `scope`
+
+## Severity Rules
+
+Each diff entry is classified as one of `info`, `notice`, `warning`, or `critical`.
+
+- `critical`: wildcard permissions such as `*`, assignment scope widened to an ancestor scope, or `assignableScopes` widened to `/` or another ancestor scope.
+- `warning`: added non-wildcard permissions, removed exclusions, changed assigned principal, or changed role assignment.
+- `notice`: removed granted permissions, added exclusions, removed assignable scopes, or removed documents.
+- `info`: reserved for low-risk changes.
+
+## Exit Codes
+
+- `0`: no critical findings.
+- `1`: one or more critical findings.
+- `2`: invalid input, unreadable files, malformed JSON, or unsupported document shape.
+
+## Tests
+
+Pytest coverage includes:
+
+- Added role-definition action detection.
+- Wildcard action detection and non-zero critical exit.
+- `assignableScopes` widening to `/`.
+- Role-assignment `principalId` changes.
+- Role-assignment scope widening.
+- Flat list input.
+- Azure list response input.
+- SARIF output.
+- Plain text output without ANSI color when stdout is not a TTY.
+
+## Status
+
+- [x] CLI argument parsing.
+- [x] Role-definition diff logic.
+- [x] Role-assignment diff logic.
+- [x] Flat list and Azure `value` list response support.
+- [x] Plain-English effective permission summaries.
+- [x] Severity classification.
+- [x] Text output and SARIF output.
+- [x] Optional OpenAI-compatible AI summary mode.
+- [x] Pytest coverage.
+

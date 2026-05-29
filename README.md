@@ -7,13 +7,32 @@ A small Python CLI to compare two Azure RBAC JSON files and print structural dif
 ```bash
 python rbac_diff.py old.json new.json
 python rbac_diff.py old.json new.json --format sarif
+python rbac_diff.py old.json new.json --ai-summary
 ```
 
 ## Output
 
 - Default output is plain text.
 - ANSI color is enabled when stdout is a TTY.
-- Exit code `3` indicates at least one critical finding.
+- Exit code `1` indicates at least one critical finding.
+
+## Optional AI Agent Summary
+
+The default CLI is deterministic and rule-based. To add an AI-generated agent summary, set an OpenAI-compatible API key and pass `--ai-summary`:
+
+```powershell
+$env:OPENAI_API_KEY="your-api-key"
+python rbac_diff.py old.json new.json --ai-summary
+```
+
+Optional settings:
+
+```powershell
+$env:OPENAI_MODEL="gpt-4o-mini"
+$env:OPENAI_BASE_URL="https://api.openai.com/v1"
+```
+
+`--ai-summary` is only supported with text output. The structured rule-based findings still determine severities and exit codes.
 
 ## Examples
 
